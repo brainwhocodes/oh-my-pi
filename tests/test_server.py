@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
-from robomp.config import Settings
+from robomp.config import Settings, reset_settings_cache
 from robomp.dashboard import tail_jsonl
 from robomp.db import close_database, get_database, issue_key
+from robomp.github_client import GitHubClient
+from robomp.manual_triage import InvalidIssueRef, parse_issue_ref
 from robomp.server import create_app
 
 
@@ -169,3 +175,358 @@ def test_tail_jsonl_recovers_from_garbage_lines(tmp_path: Path) -> None:
     assert rows[1]["level"] == "RAW"
     assert rows[1]["msg"] == "{not json}"
     assert rows[2]["level"] == "ERROR"
+
+
+# ---------- manual_triage helpers ----------
+
+
+def test_parse_issue_ref_accepts_owner_repo_hash_number() -> None:
+    assert parse_issue_ref("octo/widget#42") == ("octo/widget", 42)
+    assert parse_issue_ref("  octo/widget#42  ") == ("octo/widget", 42)
+
+
+def test_parse_issue_ref_rejects_garbage() -> None:
+    for bad in ("widget#1", "octo/widget", "octo/widget#abc", "octo widget#1", ""):
+        with pytest.raises(InvalidIssueRef):
+            parse_issue_ref(bad)
+
+
+# ---------- /api/trigger ----------
+
+
+def _enable_replay(monkeypatch: pytest.MonkeyPatch) -> str:
+    token = "trigger-secret"
+    monkeypatch.setenv("ROBOMP_REPLAY_TOKEN", token)
+    reset_settings_cache()
+    return token
+
+
+def _install_github_mock(app, transport: httpx.MockTransport) -> None:
+    """Replace the real GitHub client with one wired to a MockTransport."""
+    app.state.bag["github"] = GitHubClient("token", transport=transport)
+
+
+def test_trigger_returns_404_when_token_disabled(settings: Settings) -> None:
+    app = create_app(settings)
+    with TestClient(app) as client:
+        resp = client.post("/api/trigger", json={"mode": "triage", "issue": "octo/widget#1"})
+    close_database()
+    assert resp.status_code == 404
+    assert "trigger disabled" in resp.json()["detail"]
+
+
+def test_trigger_rejects_missing_token(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        resp = client.post("/api/trigger", json={"mode": "triage", "issue": "octo/widget#1"})
+    close_database()
+    assert resp.status_code == 401
+
+
+def test_trigger_triage_fetches_and_enqueues(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+
+    captured: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.url.path)
+        if request.url.path.endswith("/issues/7"):
+            return httpx.Response(200, json={
+                "number": 7, "title": "boom", "body": "details here",
+                "state": "open", "user": {"login": "alice"},
+                "labels": [{"name": "bug"}],
+            })
+        if request.url.path.endswith("/repos/octo/widget"):
+            return httpx.Response(200, json={
+                "full_name": "octo/widget", "default_branch": "main",
+                "clone_url": "https://github.com/octo/widget.git", "private": False,
+            })
+        return httpx.Response(404)
+
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        _install_github_mock(app, httpx.MockTransport(handler))
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "triage", "issue": "octo/widget#7"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+    close_database()
+
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["mode"] == "triage"
+    assert body["state"] == "queued"
+    assert body["delivery"] == "manual-octo__widget-7"
+    # Both endpoints should have been hit on GitHub.
+    assert any(p.endswith("/issues/7") for p in captured)
+    assert any(p.endswith("/repos/octo/widget") for p in captured)
+
+
+def test_trigger_triage_rejects_repo_not_in_allowlist(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        _install_github_mock(app, httpx.MockTransport(lambda r: httpx.Response(500)))
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "triage", "issue": "evil/repo#1"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+    close_database()
+    assert resp.status_code == 403
+    assert "ROBOMP_REPO_ALLOWLIST" in resp.json()["detail"]
+
+
+def test_trigger_triage_surfaces_github_failure(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    transport = httpx.MockTransport(lambda r: httpx.Response(404, json={"message": "Not Found"}))
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        _install_github_mock(app, transport)
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "triage", "issue": "octo/widget#999"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+    close_database()
+    assert resp.status_code == 502
+    assert "github error" in resp.json()["detail"]
+
+
+def test_trigger_retry_by_delivery_id_requeues(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        db = get_database(cfg.sqlite_path)
+        db.record_event(
+            delivery_id="d-old", event_type="issues", repo="octo/widget",
+            issue_key=issue_key("octo/widget", 4),
+            payload={"action": "opened", "issue": {"number": 4}}, state="failed",
+        )
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "retry", "delivery_id": "d-old"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+        assert resp.status_code == 202
+        assert get_database(cfg.sqlite_path).get_event("d-old").state == "queued"
+    close_database()
+
+
+def test_trigger_retry_by_issue_finds_latest_event(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        db = get_database(cfg.sqlite_path)
+        key = issue_key("octo/widget", 9)
+        db.record_event(delivery_id="d-old-1", event_type="issues", repo="octo/widget",
+                        issue_key=key, payload={"a": 1}, state="failed")
+        db.record_event(delivery_id="d-old-2", event_type="issue_comment", repo="octo/widget",
+                        issue_key=key, payload={"a": 2}, state="done")
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "retry", "issue": "octo/widget#9"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+        body = resp.json()
+        assert resp.status_code == 202, body
+        # Most recently-received row wins.
+        assert body["delivery"] == "d-old-2"
+        assert get_database(cfg.sqlite_path).get_event("d-old-2").state == "queued"
+    close_database()
+
+
+def test_trigger_retry_unknown_delivery_404s(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "retry", "delivery_id": "nope"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+    close_database()
+    assert resp.status_code == 404
+
+
+def test_trigger_rejects_bad_mode(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = _enable_replay(monkeypatch)
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/trigger",
+            json={"mode": "explode"},
+            headers={"X-Robomp-Replay-Token": token},
+        )
+    close_database()
+    assert resp.status_code == 400
+
+
+# -------- /webhook/github rate-limiting --------------------------------
+
+def _signed_headers(secret: str, body: bytes, *, event: str, delivery: str) -> dict[str, str]:
+    sig = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return {
+        "X-GitHub-Event": event,
+        "X-GitHub-Delivery": delivery,
+        "X-Hub-Signature-256": f"sha256={sig}",
+        "Content-Type": "application/json",
+    }
+
+
+def _post_issue_opened(
+    client: TestClient,
+    *,
+    delivery: str,
+    user: str,
+    number: int,
+    association: str = "NONE",
+    secret: str = "test-webhook-secret",
+):
+    payload = {
+        "action": "opened",
+        "issue": {
+            "number": number,
+            "user": {"login": user},
+            "author_association": association,
+        },
+        "repository": {"full_name": "octo/widget"},
+    }
+    body = json.dumps(payload).encode()
+    return client.post(
+        "/webhook/github",
+        content=body,
+        headers=_signed_headers(secret, body, event="issues", delivery=delivery),
+    )
+
+
+@pytest.fixture
+def rate_limited_settings(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> Settings:
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_DEFAULT", "2")
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_CONTRIBUTOR", "4")
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_WINDOW_SECONDS", "3600")
+    monkeypatch.setenv("ROBOMP_RATE_LIMIT_UNLIMITED", "can1357")
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    return cfg
+
+
+def test_webhook_rate_limits_unknown_submitter_at_default_cap(rate_limited_settings: Settings) -> None:
+    app = create_app(rate_limited_settings)
+    with TestClient(app) as client:
+        # Default cap is 2 → first two queued, third throttled.
+        states = []
+        for i in range(3):
+            resp = _post_issue_opened(
+                client, delivery=f"d-{i}", user="stranger", number=100 + i,
+                association="NONE",
+            )
+            assert resp.status_code == 202
+            states.append(resp.json()["state"])
+    close_database()
+    assert states == ["queued", "queued", "skipped"]
+
+
+def test_webhook_contributor_gets_higher_cap(rate_limited_settings: Settings) -> None:
+    app = create_app(rate_limited_settings)
+    with TestClient(app) as client:
+        # Default cap (2) would block at i=2; CONTRIBUTOR cap (4) allows it.
+        for i in range(4):
+            resp = _post_issue_opened(
+                client, delivery=f"c-{i}", user="bob", number=200 + i,
+                association="CONTRIBUTOR",
+            )
+            assert resp.status_code == 202
+            assert resp.json()["state"] == "queued", i
+        resp = _post_issue_opened(
+            client, delivery="c-x", user="bob", number=299,
+            association="CONTRIBUTOR",
+        )
+        assert resp.json()["state"] == "skipped"
+    close_database()
+
+
+def test_webhook_owner_association_bypasses_limit(rate_limited_settings: Settings) -> None:
+    app = create_app(rate_limited_settings)
+    with TestClient(app) as client:
+        for i in range(5):  # well over default cap
+            resp = _post_issue_opened(
+                client, delivery=f"o-{i}", user="acme-staff", number=300 + i,
+                association="OWNER",
+            )
+            assert resp.json()["state"] == "queued", i
+    close_database()
+
+
+def test_webhook_unlimited_allowlist_bypasses_limit(rate_limited_settings: Settings) -> None:
+    app = create_app(rate_limited_settings)
+    with TestClient(app) as client:
+        # NONE association would normally cap at 2, but `can1357` is whitelisted.
+        for i in range(5):
+            resp = _post_issue_opened(
+                client, delivery=f"u-{i}", user="can1357", number=400 + i,
+                association="NONE",
+            )
+            assert resp.json()["state"] == "queued", i
+    close_database()
+
+
+def test_webhook_rate_limit_per_user_is_independent(rate_limited_settings: Settings) -> None:
+    """One user's cap doesn't drain another user's budget."""
+    app = create_app(rate_limited_settings)
+    with TestClient(app) as client:
+        # alice exhausts default cap.
+        for i in range(2):
+            assert _post_issue_opened(
+                client, delivery=f"a-{i}", user="alice", number=500 + i,
+                association="NONE",
+            ).json()["state"] == "queued"
+        # alice's next attempt is skipped.
+        assert _post_issue_opened(
+            client, delivery="a-x", user="alice", number=599,
+            association="NONE",
+        ).json()["state"] == "skipped"
+        # bob is untouched.
+        for i in range(2):
+            assert _post_issue_opened(
+                client, delivery=f"b-{i}", user="bob", number=600 + i,
+                association="NONE",
+            ).json()["state"] == "queued"
+    close_database()
+
+
+def test_webhook_rate_limited_event_records_reason(rate_limited_settings: Settings) -> None:
+    """Throttled events must surface a useful reason on the dashboard feed."""
+    app = create_app(rate_limited_settings)
+    with TestClient(app) as client:
+        for i in range(3):
+            _post_issue_opened(
+                client, delivery=f"r-{i}", user="charlie", number=700 + i,
+                association="NONE",
+            )
+        db = get_database(rate_limited_settings.sqlite_path)
+        skipped = db.get_event("r-2")
+    close_database()
+    assert skipped is not None
+    assert skipped.state == "skipped"
+    assert skipped.last_error is not None
+    assert "rate limit" in skipped.last_error
+    assert "@charlie" in skipped.last_error

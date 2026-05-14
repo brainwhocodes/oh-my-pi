@@ -22,6 +22,8 @@ class RouteDecision:
     repo: str | None
     issue_key: str | None
     reason: str
+    submitter: str | None = None
+    association: str | None = None
 
     @property
     def should_queue(self) -> bool:
@@ -64,6 +66,20 @@ def _is_bot_account(user: Mapping[str, Any] | None, bot_login: str) -> bool:
     return False
 
 
+def _submitter_info(obj: Mapping[str, Any] | None) -> tuple[str | None, str | None]:
+    """Extract `(login, author_association)` from an issue/comment object."""
+    if not isinstance(obj, Mapping):
+        return None, None
+    user = obj.get("user")
+    login: str | None = None
+    if isinstance(user, Mapping):
+        raw = user.get("login")
+        if isinstance(raw, str) and raw:
+            login = raw
+    assoc = obj.get("author_association")
+    return login, (str(assoc) if isinstance(assoc, str) and assoc else None)
+
+
 def route(
     event_type: str,
     payload: Mapping[str, Any],
@@ -101,8 +117,11 @@ def route(
             return RouteDecision("skip", None, repo, None, "issue missing number")
         key = issue_key(repo, number)
         if action == "opened":
-            return RouteDecision("queue", "triage_issue", repo, key, "issues.opened")
+            login, assoc = _submitter_info(issue)
+            return RouteDecision("queue", "triage_issue", repo, key, "issues.opened",
+                                 submitter=login, association=assoc)
         if action == "closed":
+            # Cleanup is a lifecycle event, not a user submission; no rate-limit subject.
             return RouteDecision("queue", "cleanup_workspace", repo, key, "issues.closed")
         return RouteDecision("skip", None, repo, key, f"issues.{action} ignored")
 
@@ -119,10 +138,14 @@ def route(
             # on this payload type; the *originating-issue* key is whatever
             # the resolver returns. Serialize on the issue, not the PR.
             key = _resolve_pr_key(number)
+            login, assoc = _submitter_info(comment)
             return RouteDecision("queue", "handle_pr_conversation", repo, key,
-                                 f"issue_comment.created on PR #{number}")
+                                 f"issue_comment.created on PR #{number}",
+                                 submitter=login, association=assoc)
         key = issue_key(repo, number)
-        return RouteDecision("queue", "handle_comment", repo, key, "issue_comment.created")
+        login, assoc = _submitter_info(comment)
+        return RouteDecision("queue", "handle_comment", repo, key, "issue_comment.created",
+                             submitter=login, association=assoc)
 
     if event_type == "pull_request_review_comment" and action == "created":
         comment = payload.get("comment") or {}
@@ -135,8 +158,10 @@ def route(
         number = pr.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "PR missing number")
+        login, assoc = _submitter_info(comment)
         return RouteDecision("queue", "handle_review", repo, _resolve_pr_key(number),
-                             "pull_request_review_comment.created")
+                             "pull_request_review_comment.created",
+                             submitter=login, association=assoc)
 
     if event_type == "pull_request" and action == "closed":
         pr = payload.get("pull_request") or {}
@@ -154,9 +179,39 @@ def route(
     return RouteDecision("skip", None, repo, None, f"{event_type}.{action} not handled")
 
 
+TRUSTED_ASSOCIATIONS: frozenset[str] = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+"""GitHub `author_association` values that bypass per-user rate limiting."""
+
+
+def rate_limit_cap(
+    login: str,
+    association: str | None,
+    *,
+    unlimited: frozenset[str],
+    default: int,
+    contributor: int,
+) -> int | None:
+    """Return the per-window submission cap for a submitter, or `None` for unlimited.
+
+    Precedence: explicit `unlimited` allowlist > trusted GitHub association
+    (`OWNER`/`MEMBER`/`COLLABORATOR`) > `CONTRIBUTOR` tier > default tier.
+    """
+    if login.lower() in unlimited:
+        return None
+    if association:
+        upper = association.upper()
+        if upper in TRUSTED_ASSOCIATIONS:
+            return None
+        if upper == "CONTRIBUTOR":
+            return contributor
+    return default
+
+
 __all__ = [
     "Decision",
     "RouteDecision",
+    "TRUSTED_ASSOCIATIONS",
+    "rate_limit_cap",
     "route",
     "verify_signature",
 ]

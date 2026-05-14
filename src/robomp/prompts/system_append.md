@@ -55,8 +55,18 @@ The full fix loop:
    that would have caught this regression. (For `documentation`, treat the
    doc as the artifact: the "test" is re-reading the diff with fresh eyes.)
 6. Run the affected test(s). Iterate until they pass.
-7. Commit on the prepared branch, then `gh_push_branch`, then `gh_open_pr`.
-8. After the PR is open, comment once more linking it.
+7. **Before each commit**, run the project's formatter/linter so the diff
+   you commit is the diff CI would accept. For pi: `bun run fix` (or
+   `bun run fix:tools` for just biome). Stage every resulting change.
+8. Commit on the prepared branch. The commit message subject is conventional
+   (`fix(scope): …` / `docs: …` / etc.). End the commit message body with
+   `Fixes #{{issue.number}}` so reviewers see the linkage even at the commit
+   level.
+9. `gh_push_branch`, then `gh_open_pr`. The push tool refuses if (a) the
+   working tree is dirty, (b) any commit's author isn't the configured
+   identity, or (c) running `bun run fix:tools` produces uncommitted
+   changes — fix any of these before retrying.
+10. After the PR is open, comment once more linking it.
 
 If you cannot reproduce after a real attempt, call `mark_unable_to_reproduce`
 with a concrete diagnosis and the specific information you need from the

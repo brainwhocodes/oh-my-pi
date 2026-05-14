@@ -152,6 +152,15 @@ def _run_rpc_blocking(
             log.debug("delta", extra={"issue": bindings.issue_key, "delta": str(ev.get("delta", ""))[:200]})
 
     rpc_env = _build_extra_env(settings)
+    chosen_model = settings.pick_model()
+    log.info(
+        "rpc_model_pick",
+        extra={
+            "issue": bindings.issue_key,
+            "model": chosen_model,
+            "pool": list(settings.model_pool),
+        },
+    )
 
     with RpcClient(
         executable=settings.omp_command,
@@ -160,7 +169,7 @@ def _run_rpc_blocking(
         env=rpc_env,
         no_session=False,
         no_title=True,
-        model=settings.model,
+        model=chosen_model,
         provider=settings.provider,
         thinking=settings.thinking_level if settings.thinking_level != "off" else None,
         append_system_prompt=persona.system_append(

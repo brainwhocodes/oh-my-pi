@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from functools import cache
 from pathlib import Path
 from typing import Literal
@@ -34,12 +35,12 @@ class Settings(BaseSettings):
     repo_allowlist_raw: str = Field("", alias="ROBOMP_REPO_ALLOWLIST")
 
     # Model selection
-    model: str = Field("anthropic/claude-sonnet-4-5", alias="ROBOMP_MODEL")
+    model: str = Field("p-anthropic/claude-sonnet-4-6", alias="ROBOMP_MODEL")
     provider: str | None = Field(None, alias="ROBOMP_PROVIDER")
     thinking_level: ThinkingLevel = Field("high", alias="ROBOMP_THINKING")
 
     # Runtime
-    max_concurrency: int = Field(2, alias="ROBOMP_MAX_CONCURRENCY")
+    max_concurrency: int = Field(8, alias="ROBOMP_MAX_CONCURRENCY")
     task_timeout_seconds: float = Field(2400.0, alias="ROBOMP_TASK_TIMEOUT_SECONDS")
     request_timeout_seconds: float = Field(120.0, alias="ROBOMP_REQUEST_TIMEOUT_SECONDS")
     omp_command: str = Field("omp", alias="ROBOMP_OMP_COMMAND")
@@ -55,6 +56,17 @@ class Settings(BaseSettings):
 
     # Dev-only replay header value; if empty, /replay is disabled
     replay_token: SecretStr | None = Field(None, alias="ROBOMP_REPLAY_TOKEN")
+
+    # Per-submitter rate limiting. `window_seconds` defines the rolling window;
+    # `default` is the per-window cap for unknown/first-time submitters;
+    # `contributor` is the cap for accounts whose GitHub author_association is
+    # `CONTRIBUTOR` (i.e. already has a merged PR). `unlimited_raw` is a
+    # comma-separated allowlist of logins that bypass the limiter entirely;
+    # accounts with author_association OWNER/MEMBER/COLLABORATOR also bypass.
+    rate_limit_window_seconds: float = Field(3600.0, alias="ROBOMP_RATE_LIMIT_WINDOW_SECONDS")
+    rate_limit_default: int = Field(3, alias="ROBOMP_RATE_LIMIT_DEFAULT")
+    rate_limit_contributor: int = Field(10, alias="ROBOMP_RATE_LIMIT_CONTRIBUTOR")
+    rate_limit_unlimited_raw: str = Field("", alias="ROBOMP_RATE_LIMIT_UNLIMITED")
 
     @field_validator("bot_login", mode="after")
     @classmethod
@@ -94,8 +106,35 @@ class Settings(BaseSettings):
         items = [piece.strip().lower() for piece in self.repo_allowlist_raw.split(",")]
         return frozenset(item for item in items if item)
 
+    @field_validator("rate_limit_unlimited_raw", mode="before")
+    @classmethod
+    def _coerce_unlimited(cls, v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(item) for item in v)
+        return str(v)
+
+    @property
+    def rate_limit_unlimited(self) -> frozenset[str]:
+        items = [piece.strip().lstrip("@").lower() for piece in self.rate_limit_unlimited_raw.split(",")]
+        return frozenset(item for item in items if item)
+
     def allows(self, full_name: str) -> bool:
         return full_name.lower() in self.repo_allowlist
+
+    @property
+    def model_pool(self) -> tuple[str, ...]:
+        """ROBOMP_MODEL may be a single id or a comma-separated list; this
+        returns the parsed pool (always non-empty)."""
+        items = [piece.strip() for piece in self.model.split(",") if piece.strip()]
+        return tuple(items) or (self.model,)
+
+    def pick_model(self) -> str:
+        """Random selection from the pool (uniform). One-element pools return that one."""
+        return random.choice(self.model_pool)
 
     @property
     def resolved_author_name(self) -> str:

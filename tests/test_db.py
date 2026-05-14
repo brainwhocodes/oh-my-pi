@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from robomp.db import Database, issue_key
+from robomp.db import Database, iso_seconds_ago, issue_key
 
 
 def test_record_event_dedupes_by_delivery(db: Database) -> None:
@@ -147,3 +147,27 @@ def test_migration_adds_classification_to_existing_db(tmp_path: Path) -> None:
     database.set_issue_classification("octo/widget#1", "bug")
     assert database.get_issue("octo/widget#1").classification == "bug"
     database.close()
+
+def test_record_submission_dedupes_by_delivery(db: Database) -> None:
+    assert db.record_submission(delivery_id="d-1", login="Alice", repo="octo/widget")
+    # Retry of the same delivery id is a no-op (idempotent webhook delivery).
+    assert not db.record_submission(delivery_id="d-1", login="alice", repo="octo/widget")
+
+
+def test_count_submissions_since_is_case_insensitive(db: Database) -> None:
+    db.record_submission(delivery_id="d-1", login="Alice", repo="octo/widget")
+    db.record_submission(delivery_id="d-2", login="ALICE", repo="octo/widget")
+    db.record_submission(delivery_id="d-3", login="bob", repo="octo/widget")
+    # Window covering the whole test run.
+    since = iso_seconds_ago(60)
+    assert db.count_submissions_since("alice", since) == 2
+    assert db.count_submissions_since("ALICE", since) == 2
+    assert db.count_submissions_since("bob", since) == 1
+    assert db.count_submissions_since("nobody", since) == 0
+
+
+def test_count_submissions_since_respects_window(db: Database) -> None:
+    db.record_submission(delivery_id="d-1", login="alice", repo="octo/widget")
+    # Future cutoff means the just-inserted row is *before* the window.
+    future = iso_seconds_ago(-60)
+    assert db.count_submissions_since("alice", future) == 0

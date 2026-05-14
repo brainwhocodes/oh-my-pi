@@ -8,7 +8,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping
 
@@ -68,11 +68,24 @@ CREATE TABLE IF NOT EXISTS tool_calls (
   ts            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tool_calls_issue ON tool_calls(issue_key, ts);
+
+CREATE TABLE IF NOT EXISTS submissions (
+  delivery_id   TEXT PRIMARY KEY,
+  login         TEXT NOT NULL,
+  repo          TEXT,
+  ts            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS submissions_login_ts ON submissions(login, ts);
 """
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def iso_seconds_ago(seconds: float) -> str:
+    """ISO-UTC timestamp for `seconds` ago, matching the format `_utcnow` writes."""
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 @dataclass(slots=True, frozen=True)
@@ -149,15 +162,20 @@ class Database:
         issue_key: str | None,
         payload: Mapping[str, Any],
         state: EventState = "queued",
+        last_error: str | None = None,
     ) -> bool:
-        """Insert a webhook event. Returns False if duplicate (by delivery id)."""
+        """Insert a webhook event. Returns False if duplicate (by delivery id).
+
+        `last_error` is the reason text surfaced on the dashboard for non-queued
+        states (skipped, failed). Ignored when state == 'queued'.
+        """
         now = _utcnow()
         with self._lock:
             cur = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO events
-                  (delivery_id, event_type, repo, issue_key, payload_json, received_at, state)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (delivery_id, event_type, repo, issue_key, payload_json, received_at, state, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     delivery_id,
@@ -167,6 +185,7 @@ class Database:
                     json.dumps(payload, separators=(",", ":")),
                     now,
                     state,
+                    last_error,
                 ),
             )
             return cur.rowcount > 0
@@ -244,6 +263,39 @@ class Database:
             )
             for row in rows
         ]
+
+    def remove_event(self, delivery_id: str) -> None:
+        """Hard-delete an event row. Used to clear stale state before a manual re-trigger."""
+        with self._lock:
+            self._conn.execute("DELETE FROM events WHERE delivery_id=?", (delivery_id,))
+
+    def latest_event_for_issue(self, key: str) -> EventRow | None:
+        """Return the most recent event whose issue_key matches, or None."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT delivery_id, event_type, repo, issue_key, payload_json, received_at,
+                       state, attempts, last_error
+                FROM events
+                WHERE issue_key = ?
+                ORDER BY received_at DESC
+                LIMIT 1
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return EventRow(
+            delivery_id=row["delivery_id"],
+            event_type=row["event_type"],
+            repo=row["repo"],
+            issue_key=row["issue_key"],
+            payload=json.loads(row["payload_json"]),
+            received_at=row["received_at"],
+            state=row["state"],
+            attempts=int(row["attempts"]),
+            last_error=row["last_error"],
+        )
 
     def event_state_counts(self) -> dict[str, int]:
         """Return current row counts per event state, including states with zero rows."""
@@ -452,6 +504,35 @@ class Database:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    # ---- submissions (per-user rate limiting) ----
+    def record_submission(
+        self,
+        *,
+        delivery_id: str,
+        login: str,
+        repo: str | None,
+    ) -> bool:
+        """Idempotently log a queue-worthy submission by `login`.
+
+        Returns False if the delivery_id was already recorded (webhook retry).
+        """
+        now = _utcnow()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO submissions (delivery_id, login, repo, ts) VALUES (?, ?, ?, ?)",
+                (delivery_id, login.lower(), repo, now),
+            )
+            return cur.rowcount > 0
+
+    def count_submissions_since(self, login: str, since: str) -> int:
+        """Count submissions by `login` (case-insensitive) with ts >= `since`."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM submissions WHERE login=? AND ts>=?",
+                (login.lower(), since),
+            ).fetchone()
+        return int(row["n"]) if row is not None else 0
 
 
 _DB_SINGLETON: Database | None = None

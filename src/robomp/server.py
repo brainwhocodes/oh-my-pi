@@ -7,16 +7,22 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from robomp import github_events
 from robomp.config import Settings, get_settings
-from robomp.db import Database, get_database, issue_key as make_issue_key
+from robomp.db import Database, get_database, iso_seconds_ago, issue_key as make_issue_key
 from robomp.github_client import GitHubClient
 from robomp.queue import WorkerPool
 from robomp.sandbox import SandboxManager
 from robomp.dashboard import INDEX_HTML, tail_jsonl
+from robomp.github_client import GitHubError
+from robomp.manual_triage import (
+    InvalidIssueRef,
+    enqueue_manual_triage,
+    parse_issue_ref,
+)
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +108,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 issue_key=decision.issue_key,
                 payload=payload,
                 state="skipped",
+                last_error=decision.reason,
             )
             return JSONResponse({"delivery": x_github_delivery, "state": "skipped"}, status_code=202)
+
+        # Per-user rate limiting. Lifecycle events (cleanup) carry no submitter
+        # and are not gated. For everything user-driven, count accepted
+        # submissions in the rolling window against the tier cap.
+        submitter = decision.submitter
+        if submitter:
+            cap = github_events.rate_limit_cap(
+                submitter,
+                decision.association,
+                unlimited=cfg.rate_limit_unlimited,
+                default=cfg.rate_limit_default,
+                contributor=cfg.rate_limit_contributor,
+            )
+            if cap is not None:
+                since = iso_seconds_ago(cfg.rate_limit_window_seconds)
+                used = db.count_submissions_since(submitter, since)
+                if used >= cap:
+                    window = int(cfg.rate_limit_window_seconds)
+                    reason = (
+                        f"rate limit: @{submitter} has used {used}/{cap} submissions"
+                        f" in the last {window}s"
+                    )
+                    log.info(
+                        "rate_limited",
+                        extra={
+                            "event": x_github_event,
+                            "delivery": x_github_delivery,
+                            "login": submitter,
+                            "association": decision.association,
+                            "used": used,
+                            "cap": cap,
+                        },
+                    )
+                    db.record_event(
+                        delivery_id=x_github_delivery,
+                        event_type=x_github_event,
+                        repo=decision.repo,
+                        issue_key=decision.issue_key,
+                        payload=payload,
+                        state="skipped",
+                        last_error=reason,
+                    )
+                    return JSONResponse(
+                        {"delivery": x_github_delivery, "state": "skipped", "reason": "rate_limited"},
+                        status_code=202,
+                    )
+            db.record_submission(
+                delivery_id=x_github_delivery,
+                login=submitter,
+                repo=decision.repo,
+            )
 
         inserted = db.record_event(
             delivery_id=x_github_delivery,
@@ -140,6 +198,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.requeue_event(delivery_id)
         bag["pool"].wake()
         return JSONResponse({"delivery": delivery_id, "state": "queued"})
+
+    def _require_trigger_token(cfg: Settings, token: str | None) -> None:
+        if cfg.replay_token is None:
+            raise HTTPException(404, "trigger disabled (set ROBOMP_REPLAY_TOKEN to enable)")
+        if token != cfg.replay_token.get_secret_value():
+            raise HTTPException(401, "invalid replay token")
+
+    @app.post("/api/trigger")
+    async def api_trigger(
+        request: Request,
+        payload: dict[str, Any] = Body(...),
+        x_robomp_token: str | None = Header(None, alias="X-Robomp-Replay-Token"),
+    ) -> JSONResponse:
+        """Manually queue an issue. Modes:
+
+        - `triage`: fetch fresh from GitHub and enqueue (or re-enqueue) as if `issues.opened`.
+        - `retry`:  requeue an existing stored event. Identify it by `delivery_id` or `issue`.
+        """
+        bag = request.app.state.bag
+        cfg: Settings = bag["settings"]
+        _require_trigger_token(cfg, x_robomp_token)
+
+        db: Database = bag["db"]
+        github: GitHubClient = bag["github"]
+        pool: WorkerPool = bag["pool"]
+
+        mode = str(payload.get("mode") or "").strip().lower()
+        if mode not in ("triage", "retry"):
+            raise HTTPException(400, "mode must be 'triage' or 'retry'")
+
+        issue_ref = payload.get("issue")
+        delivery_id = payload.get("delivery_id")
+
+        if mode == "triage":
+            if not isinstance(issue_ref, str) or not issue_ref:
+                raise HTTPException(400, "triage requires 'issue' = 'owner/repo#NN'")
+            try:
+                repo_full, number = parse_issue_ref(issue_ref)
+            except InvalidIssueRef as exc:
+                raise HTTPException(400, str(exc))
+            if not cfg.allows(repo_full):
+                raise HTTPException(403, f"{repo_full} not in ROBOMP_REPO_ALLOWLIST")
+            try:
+                delivery = await enqueue_manual_triage(
+                    db=db, github=github, repo_full=repo_full, number=number,
+                )
+            except GitHubError as exc:
+                raise HTTPException(502, f"github error: {exc.status} {exc.message}")
+            pool.wake()
+            log.info("manual triage", extra={"delivery": delivery, "issue": f"{repo_full}#{number}"})
+            return JSONResponse(
+                {"delivery": delivery, "state": "queued", "mode": "triage"}, status_code=202,
+            )
+
+        # mode == "retry"
+        if isinstance(delivery_id, str) and delivery_id:
+            target = delivery_id
+        elif isinstance(issue_ref, str) and issue_ref:
+            try:
+                repo_full, number = parse_issue_ref(issue_ref)
+            except InvalidIssueRef as exc:
+                raise HTTPException(400, str(exc))
+            row = db.latest_event_for_issue(make_issue_key(repo_full, number))
+            if row is None:
+                raise HTTPException(404, f"no stored event for {repo_full}#{number}")
+            target = row.delivery_id
+        else:
+            raise HTTPException(400, "retry requires 'delivery_id' or 'issue'")
+
+        if db.get_event(target) is None:
+            raise HTTPException(404, f"unknown delivery {target}")
+        db.requeue_event(target)
+        pool.wake()
+        log.info("manual retry", extra={"delivery": target})
+        return JSONResponse(
+            {"delivery": target, "state": "queued", "mode": "retry"}, status_code=202,
+        )
 
     @app.get("/events")
     async def events(request: Request, limit: int = 50) -> dict[str, Any]:

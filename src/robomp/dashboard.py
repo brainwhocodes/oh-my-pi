@@ -139,6 +139,23 @@ INDEX_HTML = """<!doctype html>
   .toolbar input[type=checkbox] { accent-color: var(--accent); }
   .err-cell { color: var(--err); white-space: pre-wrap; word-break: break-word; max-width: 480px; }
   code { background: var(--panel-2); padding: 0 4px; border-radius: 3px; }
+  button { font: inherit; background: var(--panel-2); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.1); color: #0b1220; }
+  button.small { padding: 1px 8px; font-size: 11px; }
+  .trigger-form { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 14px;
+    align-items: center; }
+  .trigger-form input[type=text], .trigger-form input[type=password] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 5px 8px; font: inherit; min-width: 220px; }
+  .trigger-form .row-label { color: var(--muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.4px; }
+  .trigger-status { padding: 0 14px 12px; font-size: 12px; min-height: 18px; }
+  .trigger-status.err { color: var(--err); }
+  .trigger-status.ok  { color: var(--ok); }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -156,6 +173,19 @@ INDEX_HTML = """<!doctype html>
 </header>
 
 <main>
+  <section class="full">
+    <h2>trigger</h2>
+    <div class="trigger-form">
+      <span class="row-label">issue</span>
+      <input id="t-issue" type="text" placeholder="owner/repo#42" autocomplete="off" />
+      <button class="primary" id="t-triage">Fetch &amp; triage</button>
+      <button id="t-retry">Retry latest event</button>
+      <span class="row-label" style="margin-left:auto">token</span>
+      <input id="t-token" type="password" placeholder="X-Robomp-Replay-Token" autocomplete="off" />
+    </div>
+    <div class="trigger-status" id="t-status"></div>
+  </section>
+
   <section class="full">
     <h2>queue</h2>
     <div class="stats" id="stats"></div>
@@ -298,6 +328,10 @@ function renderEvents(events) {
   }
   const rows = events.map((e) => {
     const [repo, number] = (e.issue_key || "").split("#");
+    const canRetry = e.state !== "running" && e.state !== "queued";
+    const retryBtn = canRetry
+      ? `<button class="small" data-retry="${esc(e.delivery_id)}">retry</button>`
+      : '<span class="muted">—</span>';
     return `<tr>
       <td class="muted">${fmtAge(e.received_at)}</td>
       <td>${esc(e.event_type)}</td>
@@ -305,10 +339,11 @@ function renderEvents(events) {
       <td><span class="pill ${esc(e.state)}">${esc(e.state)}</span></td>
       <td class="muted">${e.attempts}</td>
       <td class="err-cell">${esc(e.last_error || "")}</td>
+      <td>${retryBtn}</td>
     </tr>`;
   }).join("");
   $("events").innerHTML =
-    `<table><thead><tr><th>received</th><th>event</th><th>where</th><th>state</th><th>tries</th><th>error</th></tr></thead><tbody>${rows}</tbody></table>`;
+    `<table><thead><tr><th>received</th><th>event</th><th>where</th><th>state</th><th>tries</th><th>error</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 let lastLogTs = "";
@@ -365,6 +400,60 @@ async function tick() {
     $("m-refresh").textContent = "error: " + err.message;
   }
 }
+
+// ----- trigger -----
+const TOKEN_KEY = "robomp.replay_token";
+$("t-token").value = localStorage.getItem(TOKEN_KEY) || "";
+
+function setStatus(text, kind) {
+  const el = $("t-status");
+  el.textContent = text;
+  el.className = "trigger-status" + (kind ? " " + kind : "");
+}
+
+async function postTrigger(body) {
+  const token = $("t-token").value.trim();
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers["X-Robomp-Replay-Token"] = token;
+  setStatus("…", "");
+  let resp;
+  try {
+    resp = await fetch("api/trigger", { method: "POST", headers, body: JSON.stringify(body) });
+  } catch (err) {
+    setStatus("network error: " + err.message, "err");
+    return;
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (_) { /* may be empty */ }
+  if (!resp.ok) {
+    const msg = (data && (data.detail || data.message)) || resp.statusText;
+    setStatus(`error ${resp.status}: ${msg}`, "err");
+    return;
+  }
+  setStatus(`queued ${data.mode}: ${data.delivery}`, "ok");
+  tick();  // refresh dashboard so the new event shows immediately
+}
+
+$("t-triage").addEventListener("click", () => {
+  const issue = $("t-issue").value.trim();
+  if (!issue) { setStatus("enter owner/repo#NN", "err"); return; }
+  postTrigger({ mode: "triage", issue });
+});
+$("t-retry").addEventListener("click", () => {
+  const issue = $("t-issue").value.trim();
+  if (!issue) { setStatus("enter owner/repo#NN", "err"); return; }
+  postTrigger({ mode: "retry", issue });
+});
+$("t-issue").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("t-triage").click();
+});
+$("events").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button[data-retry]");
+  if (!btn) return;
+  postTrigger({ mode: "retry", delivery_id: btn.dataset.retry });
+});
 
 $("log-level").addEventListener("change", tick);
 $("log-filter").addEventListener("input", tick);

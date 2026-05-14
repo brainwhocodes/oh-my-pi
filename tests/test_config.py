@@ -62,3 +62,37 @@ def test_blank_bot_login_rejected(monkeypatch: pytest.MonkeyPatch, env: dict[str
     reset_settings_cache()
     with pytest.raises(Exception):
         Settings()  # type: ignore[call-arg]
+
+
+def test_model_pool_single(env: dict[str, str]) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.model_pool == (cfg.model,)
+    assert cfg.pick_model() == cfg.model
+
+
+def test_model_pool_csv_parses(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv(
+        "ROBOMP_MODEL",
+        " p-codex/gpt-5.4 , p-anthropic/claude-sonnet-4-6 ,, p-anthropic/claude-opus-4-7 ",
+    )
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.model_pool == (
+        "p-codex/gpt-5.4",
+        "p-anthropic/claude-sonnet-4-6",
+        "p-anthropic/claude-opus-4-7",
+    )
+
+
+def test_pick_model_covers_full_pool(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    """With a 3-item pool and 500 picks, each option appears at least once."""
+    monkeypatch.setenv("ROBOMP_MODEL", "a,b,c")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    seen = {cfg.pick_model() for _ in range(500)}
+    assert seen == {"a", "b", "c"}
+
+
+def test_max_concurrency_default_is_8(env: dict[str, str]) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.max_concurrency == 8

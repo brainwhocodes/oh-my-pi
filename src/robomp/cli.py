@@ -4,23 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
-from pathlib import Path
-from typing import Any
 
 import click
 import uvicorn
 
 from robomp.config import Settings, get_settings
-from robomp.db import Database, get_database
+from robomp.db import get_database
 from robomp.github_client import GitHubClient
 from robomp.logging_config import configure_logging
+from robomp.manual_triage import InvalidIssueRef, enqueue_manual_triage, parse_issue_ref
 from robomp.queue import WorkerPool
 from robomp.sandbox import SandboxManager
 from robomp.server import create_app
-
-_ISSUE_REF = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^#\s]+)#(?P<number>\d+)$")
 
 
 def _settings_or_die() -> Settings:
@@ -56,49 +52,21 @@ def triage(issue_ref: str) -> None:
     cfg = _settings_or_die()
     configure_logging(cfg.log_dir)
     cfg.ensure_paths()
-    match = _ISSUE_REF.match(issue_ref.strip())
-    if match is None:
-        click.echo("expected owner/repo#NN", err=True)
+    try:
+        repo_full, number = parse_issue_ref(issue_ref)
+    except InvalidIssueRef as exc:
+        click.echo(str(exc), err=True)
         sys.exit(2)
-    repo_full = f"{match.group('owner')}/{match.group('repo')}"
-    number = int(match.group("number"))
     if not cfg.allows(repo_full):
         click.echo(f"refusing: {repo_full} not in ROBOMP_REPO_ALLOWLIST", err=True)
         sys.exit(2)
 
     async def _go() -> None:
         github = GitHubClient(cfg.github_token.get_secret_value())
-        issue = await github.get_issue(repo_full, number)
-        repo = await github.get_repo(repo_full)
-        payload: dict[str, Any] = {
-            "action": "opened",
-            "issue": {
-                "number": issue.number,
-                "title": issue.title,
-                "body": issue.body,
-                "state": issue.state,
-                "user": {"login": issue.author},
-                "labels": [{"name": lbl} for lbl in issue.labels],
-            },
-            "repository": {
-                "full_name": repo.full_name,
-                "default_branch": repo.default_branch,
-                "clone_url": repo.clone_url,
-                "private": repo.private,
-            },
-        }
         db = get_database(cfg.sqlite_path)
-        delivery = f"manual-{repo_full.replace('/', '__')}-{number}"
-        db.record_event(
-            delivery_id=delivery,
-            event_type="issues",
-            repo=repo_full,
-            issue_key=f"{repo_full}#{number}",
-            payload=payload,
-            state="queued",
+        delivery = await enqueue_manual_triage(
+            db=db, github=github, repo_full=repo_full, number=number,
         )
-        # If the row already exists, force it back to queued.
-        db.requeue_event(delivery)
         sandbox = SandboxManager(cfg.workspace_root)
         pool = WorkerPool(settings=cfg, db=db, github=github, sandbox=sandbox)
         await pool.start()

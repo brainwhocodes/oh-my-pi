@@ -159,6 +159,57 @@ def _build_push_branch(bindings: ToolBindings) -> HostTool[Any, Any]:
             )
             _audit(bindings, "gh_push_branch", args, error=msg)
             _raise_command(msg)
+        # Working-tree cleanliness gate. Any uncommitted change (edits the agent
+        # forgot to `git add && git commit`, files dropped by `bun install`, etc.)
+        # would silently land in the PR review delta but not in the commit history.
+        # Reject so the agent either commits or stashes them.
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=repo_dir, capture_output=True, text=True, check=False,
+        )
+        if status.stdout.strip():
+            dirty = "\n  ".join(status.stdout.strip().splitlines())
+            msg = (
+                "refusing to push: working tree is dirty.\n  "
+                f"{dirty}\n"
+                "Commit (or `git stash`) every change before pushing — anything in the "
+                "worktree that isn't in a commit won't appear in the PR."
+            )
+            _audit(bindings, "gh_push_branch", args, error=msg)
+            _raise_command(msg)
+
+        # Lint/format gate. Best-effort: run the project's `fix` script (typically
+        # `bun run fix:tools` → biome). If the script exists, succeeds, AND
+        # produces changes, the commits aren't formatted — refuse so the agent
+        # amends them. If the script isn't available, we silently proceed (other
+        # repos may not define it).
+        if (bindings.workspace.repo_dir / "package.json").exists():
+            for script in ("fix:tools", "fix"):
+                proc_fix = subprocess.run(
+                    ["bun", "run", "--silent", script],
+                    cwd=repo_dir, capture_output=True, text=True, check=False,
+                    timeout=180,
+                )
+                if proc_fix.returncode != 0:
+                    # Script not defined / bun missing / install missing — try next or skip.
+                    continue
+                status2 = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=repo_dir, capture_output=True, text=True, check=False,
+                )
+                if status2.stdout.strip():
+                    dirty = "\n  ".join(status2.stdout.strip().splitlines())
+                    msg = (
+                        f"refusing to push: `bun run {script}` produced unformatted-file "
+                        "changes that aren't in any commit. The commit history won't pass "
+                        f"CI as-is. Diff:\n  {dirty}\n"
+                        "Amend the offending commit(s) with the formatter output: "
+                        "`git add -A && git commit --amend --no-edit --reset-author`."
+                    )
+                    _audit(bindings, "gh_push_branch", args, error=msg)
+                    _raise_command(msg)
+                break  # successful and clean — done
+
 
         proc = subprocess.run(
             ["git", "push", "--set-upstream", "origin", branch],
@@ -206,6 +257,16 @@ def _build_open_pr(bindings: ToolBindings) -> HostTool[Any, Any]:
                     f"PR body missing required section header {required!r}. "
                     "Follow the template in the system prompt verbatim."
                 )
+        # Auto-close keyword. GitHub closes the linked issue on merge only when
+        # one of `Fixes / Closes / Resolves #<n>` is present in the PR body.
+        n = bindings.issue.number
+        accepted = [f"{kw} #{n}" for kw in ("Fixes", "Closes", "Resolves", "fixes", "closes", "resolves")]
+        if not any(form in body for form in accepted):
+            _raise_command(
+                f"PR body must include `Fixes #{n}` (or `Closes #{n}` / `Resolves #{n}`) so "
+                "GitHub auto-closes the issue when the PR merges. Put it at the end of the "
+                "Verification section per the template."
+            )
         # Make sure the branch is pushed (idempotent).
         push_proc = subprocess.run(
             ["git", "push", "--set-upstream", "origin", bindings.workspace.branch],

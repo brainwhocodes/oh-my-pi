@@ -409,3 +409,90 @@ def test_gh_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> 
         assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
     finally:
         _stop_loop(loop, thread)
+
+
+def test_gh_open_pr_requires_closes_keyword(db: Database, tmp_path: Path) -> None:
+    """gh_open_pr refuses if the body has the four sections but no Fixes/Closes/Resolves keyword."""
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_open_pr")
+        body = (
+            "## Repro\nrepro\n\n## Cause\ncause\n\n"
+            "## Fix\nfix\n\n## Verification\nran tests\n"
+        )
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute({"title": "fix: x", "body": body}, _ctx())
+        assert "Fixes #42" in str(exc.value)
+    finally:
+        _stop_loop(loop, t)
+
+
+def test_gh_push_branch_rejects_dirty_worktree(db: Database, tmp_path: Path) -> None:
+    """Pre-push gate refuses if the working tree has uncommitted changes."""
+    import os, subprocess
+
+    # Real upstream + worktree so git status works.
+    bare = tmp_path / "upstream.git"
+    bare.mkdir()
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(bare)],
+                   check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "robomp-bot", "GIT_AUTHOR_EMAIL": "robomp-bot@example.invalid",
+        "GIT_COMMITTER_NAME": "robomp-bot", "GIT_COMMITTER_EMAIL": "robomp-bot@example.invalid",
+    }
+    subprocess.run(["git", "init", "--initial-branch=main", str(seed)], check=True, capture_output=True)
+    (seed / "README.md").write_text("init\n")
+    for cmd in (
+        ["git", "-C", str(seed), "add", "."],
+        ["git", "-C", str(seed), "-c", "user.email=robomp-bot@example.invalid", "-c",
+         "user.name=robomp-bot", "commit", "-m", "init"],
+        ["git", "-C", str(seed), "remote", "add", "origin", str(bare)],
+        ["git", "-C", str(seed), "push", "origin", "main"],
+    ):
+        subprocess.run(cmd, check=True, capture_output=True, env=env)
+
+    from robomp.sandbox import SandboxManager
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = mgr.ensure_workspace(
+        repo="octo/widget", number=42, title="dirty test",
+        clone_url=str(bare), default_branch="main",
+        author_name="robomp-bot", author_email="robomp-bot@example.invalid",
+    )
+    # Make a proper commit (so the identity gate passes).
+    (ws.repo_dir / "a.txt").write_text("a\n")
+    subprocess.run(["git", "-C", str(ws.repo_dir), "add", "a.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(ws.repo_dir),
+         "-c", "user.email=robomp-bot@example.invalid", "-c", "user.name=robomp-bot",
+         "commit", "-m", "ok"],
+        check=True, capture_output=True, env=env,
+    )
+    # Now dirty the worktree — uncommitted edit.
+    (ws.repo_dir / "a.txt").write_text("a-modified\n")
+
+    github = GitHubClient("tok", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    loop, thread = _make_loop_in_background()
+    try:
+        bindings = ToolBindings(
+            db=db, github=github, repo=_stub_repo(),
+            issue=IssueInfo(repo="octo/widget", number=42, title="t", body="", state="open",
+                            author="alice", labels=(), is_pull_request=False),
+            workspace=ws, loop=loop,
+            author_name="robomp-bot", author_email="robomp-bot@example.invalid",
+        )
+        db.upsert_issue(key=bindings.issue_key, repo="octo/widget", number=42, state="reproducing",
+                        branch=ws.branch, session_dir=str(ws.session_dir))
+        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute({}, _ctx())
+        assert "working tree is dirty" in str(exc.value)
+        # Nothing pushed.
+        refs = subprocess.run(
+            ["git", "-C", str(bare), "for-each-ref", "--format=%(refname)"],
+            capture_output=True, text=True, check=True,
+        )
+        assert not any(r.startswith("refs/heads/farm/") for r in refs.stdout.splitlines()), refs.stdout
+    finally:
+        _stop_loop(loop, thread)

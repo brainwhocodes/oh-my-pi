@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 
-from robomp.github_events import route, verify_signature
+from robomp.github_events import rate_limit_cap, route, verify_signature
 
 ALLOWLIST = frozenset({"octo/widget"})
 BOT = "robomp-bot"
@@ -240,3 +240,99 @@ def test_route_skips_pull_request_issues_event() -> None:
         bot_login=BOT,
     )
     assert not decision.should_queue
+
+def test_route_issue_opened_captures_submitter() -> None:
+    decision = route(
+        "issues",
+        {
+            "action": "opened",
+            "issue": {
+                "number": 4,
+                "user": {"login": "alice"},
+                "author_association": "FIRST_TIME_CONTRIBUTOR",
+            },
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.submitter == "alice"
+    assert decision.association == "FIRST_TIME_CONTRIBUTOR"
+
+
+def test_route_comment_captures_comment_author_association() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "bob"},
+                "body": "hi",
+                "author_association": "CONTRIBUTOR",
+            },
+            "issue": {"number": 4},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.submitter == "bob"
+    assert decision.association == "CONTRIBUTOR"
+
+
+def test_route_pr_merged_carries_no_submitter() -> None:
+    """Lifecycle events (cleanup on merge) are not user submissions."""
+    payload = {
+        "action": "closed",
+        "pull_request": {"number": 9, "user": {"login": BOT}, "merged": True},
+        "repository": {"full_name": "octo/widget"},
+    }
+    decision = route(
+        "pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert decision.should_queue
+    assert decision.submitter is None
+
+
+def test_rate_limit_cap_unlimited_allowlist_beats_association() -> None:
+    # Even a NONE association is unlimited when login is in the explicit list.
+    assert rate_limit_cap(
+        "can1357", "NONE",
+        unlimited=frozenset({"can1357"}),
+        default=3, contributor=10,
+    ) is None
+
+
+def test_rate_limit_cap_unlimited_is_case_insensitive() -> None:
+    assert rate_limit_cap(
+        "Can1357", None,
+        unlimited=frozenset({"can1357"}),
+        default=3, contributor=10,
+    ) is None
+
+
+def test_rate_limit_cap_trusted_associations_bypass() -> None:
+    for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
+        assert rate_limit_cap(
+            "stranger", assoc,
+            unlimited=frozenset(),
+            default=3, contributor=10,
+        ) is None, assoc
+
+
+def test_rate_limit_cap_contributor_tier() -> None:
+    assert rate_limit_cap(
+        "alice", "CONTRIBUTOR",
+        unlimited=frozenset(),
+        default=3, contributor=10,
+    ) == 10
+
+
+def test_rate_limit_cap_default_tier_for_unknown_and_first_timer() -> None:
+    for assoc in (None, "NONE", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER"):
+        assert rate_limit_cap(
+            "alice", assoc,
+            unlimited=frozenset(),
+            default=3, contributor=10,
+        ) == 3, assoc
