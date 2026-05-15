@@ -116,7 +116,8 @@ RUN pip install --upgrade pip \
     && pip install --no-deps .
 
 RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent \
-    && mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent
+    && mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent \
+    && printf '[install]\nbackend = "copyfile"\n' > /srv/agent-home/.bunfig.toml
 
 COPY entrypoint.sh /usr/local/bin/robomp-entrypoint
 RUN chmod +x /usr/local/bin/robomp-entrypoint
