@@ -77,6 +77,7 @@ export * from "./debug";
 export * from "./essential-tools";
 export * from "./eval";
 export * from "./eval-backends";
+export * from "./file-mutation-queue";
 export * from "./gh";
 export * from "./glob";
 export * from "./grep";
